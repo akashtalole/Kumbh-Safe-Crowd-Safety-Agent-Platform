@@ -1,0 +1,30 @@
+{
+  "name": "cloudscape-starter",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dsql": "^3.1075.0",
+    "@aws-sdk/dsql-signer": "^3.1075.0",
+    "@cloudscape-design/components": "3.0.1307",
+    "@cloudscape-design/design-tokens": "3.0.92",
+    "@cloudscape-design/global-styles": "1.0.59",
+    "@vercel/functions": "^3.7.4",
+    "next": "15.5.19",
+    "pg": "^8.22.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "@types/pg": "^8.20.0",
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "typescript": "5.7.2"
+  }
+}
