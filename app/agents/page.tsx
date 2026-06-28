@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Box from '@cloudscape-design/components/box'
 import Badge from '@cloudscape-design/components/badge'
 import BreadcrumbGroup from '@cloudscape-design/components/breadcrumb-group'
@@ -20,7 +20,6 @@ import Textarea from '@cloudscape-design/components/textarea'
 import KeyValuePairs from '@cloudscape-design/components/key-value-pairs'
 import KumbhShell from '@/components/kumbh-shell'
 import AuthGuard from '@/components/auth-guard'
-import { AGENTS, AGENT_LOGS } from '@/lib/mock-data'
 import { AGENT_STATUS_INDICATOR, timeAgo } from '@/lib/utils'
 import type { Agent, AgentInvocationLog } from '@/lib/types'
 
@@ -31,30 +30,124 @@ const STATUS_ICON_COLOR: Record<string, string> = {
   error: '#c7162b',
 }
 
+interface AgentWithBedrock extends Agent {
+  bedrockAgentId?: string
+  bedrockAgentAliasId?: string
+}
+
 export default function AgentsPage() {
-  const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null)
+  const [agents, setAgents] = useState<AgentWithBedrock[]>([])
+  const [logs, setLogs] = useState<AgentInvocationLog[]>([])
+  const [loading, setLoading] = useState(true)
+
+  const [selectedAgent, setSelectedAgent] = useState<AgentWithBedrock | null>(null)
   const [invokeTask, setInvokeTask] = useState('')
   const [invokeResult, setInvokeResult] = useState<string | null>(null)
   const [invoking, setInvoking] = useState(false)
-  const [flash, setFlash] = useState<{ type: 'success' | 'warning'; msg: string } | null>(null)
+  const [invokeMs, setInvokeMs] = useState<number | null>(null)
+  const [isSimulated, setIsSimulated] = useState(false)
+  const [flash, setFlash] = useState<{ type: 'success' | 'warning' | 'error'; msg: string } | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
-  const activeCount = AGENTS.filter((a) => a.status === 'active' || a.status === 'alert').length
-  const totalInvocations = AGENTS.reduce((s, a) => s + a.invocationsToday, 0)
-  const totalAlerts = AGENTS.reduce((s, a) => s + a.alertsRaised, 0)
-  const avgMs = Math.round(AGENTS.reduce((s, a) => s + a.averageResponseMs, 0) / AGENTS.length)
+  const loadAgents = useCallback(async () => {
+    try {
+      const res = await fetch('/api/agents')
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      setAgents(data.agents || [])
+      setLogs(data.logs || [])
+    } catch {
+      setFlash({ type: 'error', msg: 'Failed to load agent status from server.' })
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadAgents()
+    // Refresh every 30 seconds (matches CrowdSentinel interval)
+    const interval = setInterval(loadAgents, 30_000)
+    return () => clearInterval(interval)
+  }, [loadAgents])
+
+  const activeCount = agents.filter((a) => a.status === 'active' || a.status === 'alert').length
+  const totalInvocations = logs.length
+  const totalAlerts = logs.filter((l) => l.result === 'alert').length
+  const avgMs = logs.length
+    ? Math.round(logs.reduce((s, l) => s + l.durationMs, 0) / logs.length)
+    : 0
 
   async function handleInvoke() {
     if (!selectedAgent || !invokeTask.trim()) return
     setInvoking(true)
-    await new Promise((r) => setTimeout(r, 1400))
-    setInvokeResult(
-      `[${selectedAgent.name}] Received task: "${invokeTask}"\n\nInitializing...\nQuerying DynamoDB zone metrics...\nCalling tool: ${selectedAgent.toolsUsed[0]}\n\nResult: Task accepted. Current operational status: ${selectedAgent.lastAction}\n\nModel: ${selectedAgent.model}\nResponse time: ${Math.round(selectedAgent.averageResponseMs * (0.85 + Math.random() * 0.3))}ms\nStatus: Success`
-    )
-    setInvoking(false)
+    setInvokeResult('')
+    setInvokeMs(null)
+    setIsSimulated(false)
+
+    abortRef.current = new AbortController()
+
+    try {
+      const res = await fetch(`/api/agents/${selectedAgent.agentId}/invoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task: invokeTask }),
+        signal: abortRef.current.signal,
+      })
+
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status}`)
+      }
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        // Parse SSE lines
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          try {
+            const payload = JSON.parse(line.slice(6))
+            if (payload.chunk) {
+              setInvokeResult((prev) => (prev ?? '') + payload.chunk)
+            }
+            if (payload.done) {
+              setInvokeMs(payload.durationMs ?? null)
+              setIsSimulated(payload._simulated === true)
+              // Refresh logs after a successful invocation
+              setTimeout(loadAgents, 500)
+            }
+            if (payload.error) {
+              setInvokeResult((prev) => (prev ?? '') + `\n\n[ERROR] ${payload.error}`)
+            }
+          } catch {
+            // skip malformed SSE line
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'AbortError') {
+        setInvokeResult((prev) => (prev ?? '') + `\n[Connection error: ${err.message}]`)
+      }
+    } finally {
+      setInvoking(false)
+    }
   }
 
-  function handlePause(agent: Agent) {
-    setFlash({ type: 'warning', msg: `${agent.name} paused. Manual override active.` })
+  function handlePause(agent: AgentWithBedrock) {
+    setFlash({ type: 'warning', msg: `${agent.name} paused. Manual override active. Re-enable from Admin → Agent Config.` })
+  }
+
+  function handleCancelInvoke() {
+    abortRef.current?.abort()
+    setInvoking(false)
   }
 
   return (
@@ -91,6 +184,15 @@ export default function AgentsPage() {
             <Header
               variant="h1"
               description="Amazon Bedrock AgentCore — Strands multi-agent framework. All agents operate autonomously and escalate to human operators when required."
+              actions={
+                <Button
+                  iconName="refresh"
+                  onClick={loadAgents}
+                  loading={loading}
+                >
+                  Refresh
+                </Button>
+              }
             >
               Bedrock Agent Monitor
             </Header>
@@ -101,23 +203,31 @@ export default function AgentsPage() {
             <ColumnLayout columns={4} variant="text-grid">
               <SpaceBetween size="xxs">
                 <Box variant="awsui-key-label">Active agents</Box>
-                <div style={{ fontSize: 28, fontWeight: 700, color: '#037f51' }}>{activeCount} / {AGENTS.length}</div>
+                <div style={{ fontSize: 28, fontWeight: 700, color: '#037f51' }}>
+                  {loading ? '…' : `${activeCount} / ${agents.length}`}
+                </div>
                 <Box variant="small" color="text-body-secondary">Autonomous operation</Box>
               </SpaceBetween>
               <SpaceBetween size="xxs">
-                <Box variant="awsui-key-label">Total invocations today</Box>
-                <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--color-text-body-default-7p9esn)' }}>{totalInvocations.toLocaleString()}</div>
-                <Box variant="small" color="text-body-secondary">Across all 6 agents</Box>
+                <Box variant="awsui-key-label">Invocations logged</Box>
+                <div style={{ fontSize: 28, fontWeight: 700 }}>
+                  {loading ? '…' : totalInvocations.toLocaleString()}
+                </div>
+                <Box variant="small" color="text-body-secondary">Last 50 recorded</Box>
               </SpaceBetween>
               <SpaceBetween size="xxs">
-                <Box variant="awsui-key-label">Alerts raised today</Box>
-                <div style={{ fontSize: 28, fontWeight: 700, color: '#d6880b' }}>{totalAlerts}</div>
+                <Box variant="awsui-key-label">Alerts raised</Box>
+                <div style={{ fontSize: 28, fontWeight: 700, color: '#d6880b' }}>
+                  {loading ? '…' : totalAlerts}
+                </div>
                 <Box variant="small" color="text-body-secondary">Automated detections</Box>
               </SpaceBetween>
               <SpaceBetween size="xxs">
                 <Box variant="awsui-key-label">Avg. response time</Box>
-                <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--color-text-body-default-7p9esn)' }}>{avgMs}ms</div>
-                <Box variant="small" color="text-body-secondary">Across all agents</Box>
+                <div style={{ fontSize: 28, fontWeight: 700 }}>
+                  {loading ? '…' : avgMs ? `${avgMs}ms` : '—'}
+                </div>
+                <Box variant="small" color="text-body-secondary">Across logged invocations</Box>
               </SpaceBetween>
             </ColumnLayout>
 
@@ -126,7 +236,11 @@ export default function AgentsPage() {
                 {
                   label: 'Agent cards',
                   id: 'cards',
-                  content: (
+                  content: loading ? (
+                    <Box textAlign="center" padding="xl">
+                      <StatusIndicator type="loading">Loading agent status…</StatusIndicator>
+                    </Box>
+                  ) : (
                     <div
                       style={{
                         display: 'grid',
@@ -135,7 +249,7 @@ export default function AgentsPage() {
                         paddingTop: 16,
                       }}
                     >
-                      {AGENTS.map((agent) => (
+                      {agents.map((agent) => (
                         <AgentDetailCard
                           key={agent.agentId}
                           agent={agent}
@@ -143,6 +257,8 @@ export default function AgentsPage() {
                             setSelectedAgent(agent)
                             setInvokeResult(null)
                             setInvokeTask('')
+                            setInvokeMs(null)
+                            setIsSimulated(false)
                           }}
                           onPause={() => handlePause(agent)}
                         />
@@ -151,14 +267,16 @@ export default function AgentsPage() {
                   ),
                 },
                 {
-                  label: `Invocation log (${AGENT_LOGS.length})`,
+                  label: `Invocation log (${logs.length})`,
                   id: 'logs',
                   content: (
                     <Table<AgentInvocationLog>
                       variant="container"
-                      items={AGENT_LOGS}
+                      items={logs}
                       trackBy="logId"
-                      header={<Header variant="h2" counter={`(${AGENT_LOGS.length})`}>Recent invocations</Header>}
+                      loading={loading}
+                      loadingText="Loading invocation logs…"
+                      header={<Header variant="h2" counter={`(${logs.length})`}>Recent invocations</Header>}
                       columnDefinitions={[
                         {
                           id: 'time',
@@ -212,7 +330,7 @@ export default function AgentsPage() {
                           sortingField: 'result',
                         },
                       ]}
-                      empty={<Box textAlign="center" color="inherit">No log entries.</Box>}
+                      empty={<Box textAlign="center" color="inherit">No invocations logged yet. Invoke an agent to see entries here.</Box>}
                     />
                   ),
                 },
@@ -220,39 +338,41 @@ export default function AgentsPage() {
                   label: 'Architecture',
                   id: 'arch',
                   content: (
-                    <Container header={<Header variant="h2">Agent architecture — Bedrock Strands framework</Header>}>
+                    <Container header={<Header variant="h2">Agent architecture — Bedrock AgentCore + Strands</Header>}>
                       <SpaceBetween size="l">
                         <Box variant="p">
-                          KumbhSafe uses Amazon Bedrock AgentCore with the Strands multi-agent framework.
-                          A master orchestrator agent (CommandBridge) manages five specialised sub-agents.
+                          KumbhSafe uses Amazon Bedrock AgentCore with the Strands Agents SDK (Python).
+                          A master orchestrator agent (CommandBridge) manages five specialist sub-agents.
                           All agents persist state and alerts to Amazon DynamoDB and communicate via Amazon SNS.
+                          The Next.js frontend invokes agents via <code>BedrockAgentRuntimeClient.invokeAgent()</code> and
+                          streams responses back using Server-Sent Events.
                         </Box>
                         <ColumnLayout columns={2}>
                           <SpaceBetween size="s">
-                            <Box variant="h3">Data flow</Box>
+                            <Box variant="h3">Invocation flow</Box>
                             {[
-                              'Cameras → OpenCV crowd analysis → CrowdSentinel',
-                              'Godavari sensor + IMD API → FloodWatch',
-                              'Pilgrim registry + GPS → RouteOracle',
-                              'Ambulance GPS + hospital capacity → MedEvac',
-                              'Camera feeds + FaceID → LostConnect',
-                              'All agents → CommandBridge → Human operators',
+                              '1. EventBridge 30s schedule → Lambda → AgentCore (CrowdSentinel)',
+                              '2. EventBridge 5min schedule → Lambda → AgentCore (FloodWatch)',
+                              '3. ZONE_RED/BLACK event → CommandBridge → specialist agents',
+                              '4. ICCC Operator → Next.js → /api/agents/{id}/invoke → Bedrock AgentCore',
+                              '5. Agent uses Strands tools → DynamoDB reads/writes → SNS publish',
+                              '6. SSE chunks stream back to ICCC dashboard in real time',
                             ].map((step, i) => (
                               <div key={i} style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                                <Box variant="small" color="text-body-secondary" fontWeight="bold">{i + 1}.</Box>
                                 <Box variant="small">{step}</Box>
                               </div>
                             ))}
                           </SpaceBetween>
                           <SpaceBetween size="s">
-                            <Box variant="h3">AWS services used</Box>
+                            <Box variant="h3">AWS services</Box>
                             {[
-                              ['Amazon Bedrock AgentCore', 'Agent hosting and tool execution'],
-                              ['Amazon Nova Pro / Lite', 'LLM backbone for all agents'],
+                              ['Amazon Bedrock AgentCore', 'Managed runtime for Strands agents'],
+                              ['Amazon Nova Pro v1', 'LLM backbone — all 6 agents'],
+                              ['Strands Agents SDK (Python)', 'Tool-use framework with @tool decorators'],
                               ['Amazon DynamoDB', 'Zone state, alerts, pilgrim registry'],
-                              ['Amazon SNS', 'Bulk SMS and push notifications'],
+                              ['Amazon SNS', 'Bulk SMS · NDRF webhook · medical alerts'],
                               ['Amazon Rekognition', 'Lost person facial recognition'],
-                              ['Amazon S3', 'Camera frame storage and audit logs'],
+                              ['Aurora DSQL', 'agent_config · zone_config · audit_logs'],
                             ].map(([svc, desc]) => (
                               <div key={svc}>
                                 <Box variant="small" fontWeight="bold">{svc}</Box>
@@ -275,6 +395,7 @@ export default function AgentsPage() {
       <Modal
         visible={!!selectedAgent}
         onDismiss={() => {
+          handleCancelInvoke()
           setSelectedAgent(null)
           setInvokeResult(null)
           setInvokeTask('')
@@ -287,6 +408,7 @@ export default function AgentsPage() {
               <Button
                 variant="link"
                 onClick={() => {
+                  handleCancelInvoke()
                   setSelectedAgent(null)
                   setInvokeResult(null)
                   setInvokeTask('')
@@ -294,14 +416,17 @@ export default function AgentsPage() {
               >
                 Close
               </Button>
-              <Button
-                variant="primary"
-                loading={invoking}
-                onClick={handleInvoke}
-                disabled={!invokeTask.trim()}
-              >
-                Send task
-              </Button>
+              {invoking ? (
+                <Button onClick={handleCancelInvoke}>Cancel</Button>
+              ) : (
+                <Button
+                  variant="primary"
+                  onClick={handleInvoke}
+                  disabled={!invokeTask.trim()}
+                >
+                  Send task
+                </Button>
+              )}
             </SpaceBetween>
           </Box>
         }
@@ -312,20 +437,33 @@ export default function AgentsPage() {
               columns={3}
               items={[
                 { label: 'Model', value: selectedAgent.model },
-                { label: 'Avg response', value: `${selectedAgent.averageResponseMs}ms` },
-                { label: 'Status', value: <StatusIndicator type={AGENT_STATUS_INDICATOR[selectedAgent.status]}>{selectedAgent.status}</StatusIndicator> },
+                {
+                  label: 'Bedrock Agent ID',
+                  value: selectedAgent.bedrockAgentId
+                    ? <code style={{ fontSize: 11 }}>{selectedAgent.bedrockAgentId}</code>
+                    : <Box color="text-body-secondary" variant="small">Demo mode (no agent ID set)</Box>,
+                },
+                {
+                  label: 'Status',
+                  value: <StatusIndicator type={AGENT_STATUS_INDICATOR[selectedAgent.status]}>{selectedAgent.status}</StatusIndicator>,
+                },
               ]}
             />
             <Box variant="p" color="text-body-secondary">{selectedAgent.role}</Box>
             <Textarea
               value={invokeTask}
               onChange={({ detail }) => setInvokeTask(detail.value)}
-              placeholder={`Describe the task for ${selectedAgent.name}...`}
+              placeholder={`Describe the task for ${selectedAgent.name}…`}
               rows={3}
+              disabled={invoking}
             />
-            {invokeResult && (
+            {(invokeResult !== null) && (
               <ExpandableSection
-                headerText="Agent response"
+                headerText={
+                  invoking
+                    ? 'Agent responding…'
+                    : `Agent response${invokeMs ? ` · ${invokeMs}ms` : ''}${isSimulated ? ' · demo mode' : ''}`
+                }
                 defaultExpanded
                 variant="container"
               >
@@ -336,9 +474,11 @@ export default function AgentsPage() {
                     whiteSpace: 'pre-wrap',
                     color: 'var(--color-text-body-secondary-cwla8r, #8d99a8)',
                     lineHeight: 1.6,
+                    maxHeight: 360,
+                    overflowY: 'auto',
                   }}
                 >
-                  {invokeResult}
+                  {invokeResult || (invoking ? '▌' : '')}
                 </div>
               </ExpandableSection>
             )}
@@ -354,7 +494,7 @@ function AgentDetailCard({
   onInvoke,
   onPause,
 }: {
-  agent: Agent
+  agent: AgentWithBedrock
   onInvoke: () => void
   onPause: () => void
 }) {
@@ -379,7 +519,7 @@ function AgentDetailCard({
             <Box variant="p" fontWeight="bold">{agent.name}</Box>
           </StatusIndicator>
           <Box variant="small" color="text-body-secondary">
-            {agent.model.split('.')[0]} · {agent.model.split('-')[1] ?? 'nova'}
+            {agent.model}
           </Box>
         </SpaceBetween>
         <Badge
@@ -418,23 +558,14 @@ function AgentDetailCard({
         &gt; {agent.lastAction}
       </div>
 
-      {/* Stats row */}
-      <ColumnLayout columns={3} variant="text-grid">
-        <SpaceBetween size="xxs">
-          <Box variant="awsui-key-label" fontSize="body-s">Invocations</Box>
-          <Box fontWeight="bold">{agent.invocationsToday.toLocaleString()}</Box>
-        </SpaceBetween>
-        <SpaceBetween size="xxs">
-          <Box variant="awsui-key-label" fontSize="body-s">Alerts raised</Box>
-          <Box fontWeight="bold" color={agent.alertsRaised > 0 ? 'text-status-warning' : undefined}>
-            {agent.alertsRaised}
-          </Box>
-        </SpaceBetween>
-        <SpaceBetween size="xxs">
-          <Box variant="awsui-key-label" fontSize="body-s">Avg. latency</Box>
-          <Box fontWeight="bold">{agent.averageResponseMs}ms</Box>
-        </SpaceBetween>
-      </ColumnLayout>
+      {/* Bedrock Agent ID chip */}
+      {agent.bedrockAgentId ? (
+        <Box variant="small" color="text-body-secondary">
+          AgentCore: <code style={{ fontSize: 10 }}>{agent.bedrockAgentId}</code>
+        </Box>
+      ) : (
+        <Box variant="small" color="text-status-inactive">No Bedrock Agent ID — demo mode</Box>
+      )}
 
       {/* Tools used */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
@@ -458,7 +589,7 @@ function AgentDetailCard({
 
       {/* Updated */}
       <Box variant="small" color="text-body-secondary">
-        Last action: {timeAgo(agent.lastActionTime)}
+        Last updated: {timeAgo(agent.lastActionTime)}
       </Box>
 
       {/* Action buttons */}
