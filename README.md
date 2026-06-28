@@ -3,7 +3,7 @@
 A production-grade disaster management platform for the Nashik Simhastha Kumbh Mela 2027, built with **Next.js 16**, **Cloudscape Design System**, and **AWS Aurora DSQL**.
 
 ## Overview
-
+![Alt Text](docs/Kumbh-Safe-Crowd-Safety.png)
 KumbhSafe provides real-time crisis management across multiple zones with:
 
 - **Live zone density monitoring** with crowdflow visualization
@@ -89,7 +89,7 @@ Real-time command center with:
 - System configuration
 
 ## Architecture
-
+![Alt Text](docs/KumbhSafeArch.png)
 ### Technology Stack
 
 - **Frontend**: Next.js 16 (App Router) + React 19
